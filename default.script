@@ -1,0 +1,123 @@
+#!/bin/sh
+
+# udhcpc script edited by Tim Riker <Tim@Rikers.org>
+# Optimized for TreeFrogUI: IPv6 timeout bypass & Google DNS injection.
+
+[ -z "$1" ] && echo "Error: should be called from udhcpc" && exit 1
+
+RESOLV_CONF="/etc/resolv.conf"
+[ -e $RESOLV_CONF ] || touch $RESOLV_CONF
+[ -n "$broadcast" ] && BROADCAST="broadcast $broadcast"
+[ -n "$subnet" ] && NETMASK="netmask $subnet"
+# Handle stateful DHCPv6 like DHCPv4
+[ -n "$ipv6" ] && ip="$ipv6/128"
+
+# [OPTIMIZACIÓN] Anulamos el delay de IPv6 para evitar congelamientos en el Wi-Fi USB
+IF_WAIT_DELAY=0
+
+wait_for_ipv6_default_route() {
+	# Retorno inmediato para no consumir CPU ni RAM en bucles residuales
+	return 0
+}
+
+case "$1" in
+	deconfig)
+		/sbin/ifconfig $interface up
+		/sbin/ifconfig $interface 0.0.0.0
+
+		# drop info from this interface
+		# resolv.conf may be a symlink to /tmp/, so take care
+		TMPFILE=$(mktemp)
+		grep -vE "# $interface\$" $RESOLV_CONF > $TMPFILE
+		cat $TMPFILE > $RESOLV_CONF
+		rm -f $TMPFILE
+
+		if [ -x /usr/sbin/avahi-autoipd ]; then
+			/usr/sbin/avahi-autoipd -c $interface && /usr/sbin/avahi-autoipd -k $interface
+		fi
+		;;
+
+	leasefail|nak)
+		if [ -x /usr/sbin/avahi-autoipd ]; then
+			/usr/sbin/avahi-autoipd -c $interface || /usr/sbin/avahi-autoipd -wD $interface --no-chroot
+		fi
+		;;
+
+	renew|bound)
+		# [LÍNEA DE RASTREO] Confirmación visual para saber si udhcpc realmente está llamando a este archivo
+		[ -f /mnt/sdcard/log.txt ] && echo "NETWORK: default.script ha sido invocado exitosamente por udhcpc para configurar la interfaz $interface" >> /mnt/sdcard/log.txt
+
+		if [ -x /usr/sbin/avahi-autoipd ]; then
+			/usr/sbin/avahi-autoipd -c $interface && /usr/sbin/avahi-autoipd -k $interface
+		fi
+		/sbin/ifconfig $interface $ip $BROADCAST $NETMASK
+		if [ -n "$ipv6" ] ; then
+			wait_for_ipv6_default_route
+		fi
+
+		# RFC3442: If the DHCP server returns both a Classless
+		# Static Routes option and a Router option, the DHCP
+		# client MUST ignore the Router option.
+		if [ -n "$staticroutes" ]; then
+			echo "deleting routers"
+			route -n | while read dest gw mask flags metric ref use iface; do
+				[ "$iface" != "$interface" -o "$gw" = "0.0.0.0" ] || \
+					route del -net "$dest" netmask "$mask" gw "$gw" dev "$interface"
+			done
+
+			# format: dest1/mask gw1 ... destn/mask gwn
+			set -- $staticroutes
+			while [ -n "$1" -a -n "$2" ]; do
+				route add -net "$1" gw "$2" dev "$interface"
+				shift 2
+			done
+		elif [ -n "$router" ] ; then
+			echo "deleting routers"
+			while route del default gw 0.0.0.0 dev $interface 2> /dev/null; do
+				:
+			done
+
+			for i in $router ; do
+				route add default gw $i dev $interface
+			done
+		fi
+
+		# drop info from this interface
+		# resolv.conf may be a symlink to /tmp/, so take care
+		TMPFILE=$(mktemp)
+		grep -vE "# $interface\$" $RESOLV_CONF > $TMPFILE
+		cat $TMPFILE > $RESOLV_CONF
+		rm -f $TMPFILE
+
+		# prefer rfc3397 domain search list (option 119) if available
+		if [ -n "$search" ]; then
+			search_list=$search
+		elif [ -n "$domain" ]; then
+			search_list=$domain
+		fi
+
+		[ -n "$search_list" ] && \
+			echo "search $search_list # $interface" >> $RESOLV_CONF
+
+		for i in $dns ; do
+			echo adding dns $i
+			echo "nameserver $i # $interface" >> $RESOLV_CONF
+		done
+
+		# [MEJORA CRÍTICA] Inyección de DNS fija de Google para asegurar conexiones complejas (Google Drive)
+		if ! grep -q "8.8.8.8" $RESOLV_CONF; then
+			echo "nameserver 8.8.8.8 # fallback_google" >> $RESOLV_CONF
+		fi
+		;;
+esac
+
+HOOK_DIR="$0.d"
+if [ -d "${HOOK_DIR}" ]; then
+	for hook in "${HOOK_DIR}/"*; do
+		[ -f "${hook}" -a -x "${hook}" ] || continue
+		"${hook}" "${@}"
+	done
+fi
+
+exit 0
+
